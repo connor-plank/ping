@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <arpa/inet.h>
+#include <signal.h>
 
 
 // this is in the GNU C library but is rewritten here to remove dependency
@@ -61,8 +62,29 @@ uint16_t checksum(int count, const void* addr)
     return (uint16_t)~sum;
 }
 
+volatile __sig_atomic_t RUNNING = 1;
+
+void handle_sigint(int sig) 
+{
+    RUNNING = 0;
+}
+
+
+
 int main(int argc, char* argv[])
 {
+    // setup signal handler for graceful shutdown
+    struct sigaction sa;
+    sa.sa_handler = handle_sigint;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+
+    if(sigaction(SIGINT, &sa, NULL) == -1)
+    {
+        printf("Error: couldn't set up signal handler\n");
+        return -1;
+    }
+
     // 1.
     int sfd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
     if(sfd == -1)
@@ -109,9 +131,10 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    uint16_t seq = 0;
     struct timespec next;
-    while(1)
+    uint16_t seq = 0;
+    double cumulative_ms = 0;
+    while(RUNNING)
     {
         // add a payload containing timespec
         struct timespec now;
@@ -130,13 +153,15 @@ int main(int argc, char* argv[])
             nanosleep(&sleep, NULL);
         }
 
+        seq++;
+
         // 2. Packet construction (could alternatively do this as a buffer of bytes instead of struct: uint8_t packet[])
         struct icmphdr echo;
         memset(&echo, 0, sizeof(echo));
         echo.type = 8; // type == echo request
         echo.code = 0;
         echo.un.echo.id = getpid();
-        echo.un.echo.sequence = seq++;
+        echo.un.echo.sequence = seq;
 
         timespec_get(&now, TIME_UTC);
         memcpy(&next, &now, sizeof(now));
@@ -221,13 +246,17 @@ int main(int argc, char* argv[])
             if(recvd_header.type != 0 // echo reply
                 || recvd_header.code != echo.code)  
             {
-                printf("Received header but didn't match code\n");
+                // printf("Received header but didn't match code\n");
                 continue; // wasn't our reply packet, on to the next;
             }
             else if(recvd_header.un.echo.id != getpid())
             {
-                printf("Received header but echo id didn't match pid\n");
+                // printf("Received header but echo id didn't match pid\n");
                 continue;
+            }
+            else if(recvd_header.un.echo.sequence != seq)
+            {
+                // printf("Received header but for wrong sequence\n");
             }
             else 
             {
@@ -251,7 +280,12 @@ int main(int argc, char* argv[])
 
         time_t rtt = d_sec * 1e9 + d_nanos;
         printf("seq = %u time = %f ms\n", seq, 1e-6*rtt);
+        cumulative_ms+=1e-6*rtt;
     }
+
+    // print averages
+    double avg_ms = cumulative_ms/seq;
+    printf("Average RTT: %lf\n", avg_ms);
 
     close(sfd);
 
