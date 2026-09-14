@@ -1,6 +1,12 @@
 # ping 
 This repo contains a simple ping binary implemented in C used to learn about sockets and IP
 
+```bash
+gcc ping.c -o ping 
+sudo setcap cap_net_raw+ep ping 
+./ping x.x.x.x
+```
+
 ## stages
 1. SOCKET SETUP
    - socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)
