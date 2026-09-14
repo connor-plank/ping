@@ -81,28 +81,16 @@ int main(int argc, char* argv[])
         }
     }
 
-    // 2. (could alternatively do this as a buffer of bytes instead of struct: uint8_t packet[])
-    struct icmphdr echo;
-    memset(&echo, 0, sizeof(echo));
-    echo.type = 8; // type == echo request
-    echo.code = 0;
-    echo.un.echo.id = getpid();
-    uint16_t seq = 0;
-    echo.un.echo.sequence = seq++;
-
-    // add a payload containing timespec
-    struct timespec now;
-    timespec_get(&now, TIME_UTC);
-
-    // create packet of bytes
-    size_t packet_len = sizeof(now) + sizeof(echo);
-    char *packet = malloc(packet_len);
-    memcpy(packet, &echo, sizeof(echo));
-    memcpy(packet + sizeof(echo), &now, sizeof(now));
-
-    echo.checksum = checksum(packet_len, packet);
-    memcpy(packet, &echo, sizeof(echo));
-
+    // set timeout
+    struct timeval timeout;
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+    if(setsockopt(sfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
+    {
+        printf("Error: setting socket timeout failed\n");
+        close(sfd);
+        return -1;
+    }
 
     //3. test checksum
     uint8_t checksum_test[] = {0xA8, 0x4D, 0x00, 0x00};
@@ -121,111 +109,151 @@ int main(int argc, char* argv[])
         return -1;
     }
 
-    // 4. SEND
-    // get ip from first CLA 
-    if(argc < 2)
-    {
-        printf("Error: binary requires a destination address as the first argument\n");
-        close(sfd);
-        return -1;
-    }
-    char* dest = argv[1];
-
-    // parse addr into individual bytes (assuming IPv4)
-    // char* tok = strtok(dest, "."); // delim == ".";
-    // uint8_t addr[4];
-    // char *end_ptr = calloc(2, 1);
-    // end_ptr[0] = '.';
-    // for(int i = 0; i < 4; i++)
-    // {
-    //     if(tok == NULL)
-    //     {
-    //         printf("Error: IPv4 address should have 4 bytes\n");
-    //     }
-    //     unsigned long byte = strtoul(tok, &end_ptr, 10);
-    //     // check for overflow
-    //     if(byte > 256) 
-    //     {
-    //         printf("Error: each component of the IPv4 address must be less than 256\n");
-    //     }
-    //     addr[i] = (uint8_t)byte;
-    //
-    //     // go to the next token
-    //     tok = strtok(NULL, ".");
-    // }
-
-    //convert addr into 4 byte unsigned integer
-    struct sockaddr_in saddr;
-    memset(&saddr, 0, sizeof(saddr));
-    saddr.sin_family = AF_INET;
-    int ret = inet_pton(AF_INET, argv[1], &saddr.sin_addr);
-    if(ret <= 0) 
-    {
-        printf("Error: failed to parse address string, should match x.x.x.x\n");
-        close(sfd);
-        return -1;
-    }
-
-    size_t bytes_sent = sendto(sfd, packet, packet_len, 0, (struct sockaddr*)&saddr, sizeof(saddr));
-    if(bytes_sent < packet_len)
-    {
-        printf("Error: only sent %ld/%ld bytes\n", bytes_sent, packet_len);
-        close(sfd);
-        return -1;
-    }
-
-    // 5. RECEIVE + PARSE
-    char buf[256];
-    socklen_t saddrlen = sizeof(saddr);
-    char* recvd_packet = malloc(packet_len); // should be same length as sent packet (constant anyway)
-    struct icmphdr recvd_header;
+    uint16_t seq = 0;
+    struct timespec next;
     while(1)
     {
-        // check if we have been waiting more than a second
+        // add a payload containing timespec
+        struct timespec now;
         timespec_get(&now, TIME_UTC);
         
+        struct timespec sleep;
+        sleep.tv_sec = next.tv_sec - now.tv_sec;
+        sleep.tv_nsec = next.tv_nsec - now.tv_nsec;
+        if(next.tv_sec > now.tv_sec || (next.tv_sec == now.tv_sec && next.tv_nsec >= now.tv_nsec))
+        {
+            if(sleep.tv_nsec < 0)
+            {
+                sleep.tv_sec--;
+                sleep.tv_nsec+=1e9;
+            }
+            nanosleep(&sleep, NULL);
+        }
 
-        size_t bytes_recvd = recvfrom(sfd, buf, 256, 0, (struct sockaddr*)&saddr, &saddrlen);
+        // 2. Packet construction (could alternatively do this as a buffer of bytes instead of struct: uint8_t packet[])
+        struct icmphdr echo;
+        memset(&echo, 0, sizeof(echo));
+        echo.type = 8; // type == echo request
+        echo.code = 0;
+        echo.un.echo.id = getpid();
+        echo.un.echo.sequence = seq++;
 
-        // get size of IP header 
-        int IHL_bytes = (buf[0] & 0x0f)*4;
-        // printf("Received packet with IP header of size %d\n", IHL_bytes);
-        // extract ICMP packet
-        if(bytes_recvd <= IHL_bytes)
+        timespec_get(&now, TIME_UTC);
+        memcpy(&next, &now, sizeof(now));
+        next.tv_sec+=1; // will ping by the next 5 seconds;
+
+
+        // create packet of bytes
+        size_t packet_len = sizeof(now) + sizeof(echo);
+        char *packet = malloc(packet_len);
+        memcpy(packet, &echo, sizeof(echo));
+        memcpy(packet + sizeof(echo), &now, sizeof(now));
+
+        echo.checksum = checksum(packet_len, packet);
+        memcpy(packet, &echo, sizeof(echo));
+
+        // 4. SEND
+        // get ip from first CLA 
+        if(argc < 2)
+        {
+            printf("Error: binary requires a destination address as the first argument\n");
+            close(sfd);
+            return -1;
+        }
+        char* dest = argv[1];
+
+
+        //convert addr into 4 byte unsigned integer
+        struct sockaddr_in saddr;
+        memset(&saddr, 0, sizeof(saddr));
+        saddr.sin_family = AF_INET;
+        int ret = inet_pton(AF_INET, argv[1], &saddr.sin_addr);
+        if(ret <= 0) 
+        {
+            printf("Error: failed to parse address string, should match x.x.x.x\n");
+            close(sfd);
+            return -1;
+        }
+
+        size_t bytes_sent = sendto(sfd, packet, packet_len, 0, (struct sockaddr*)&saddr, sizeof(saddr));
+        if(bytes_sent < packet_len)
+        {
+            printf("Error: only sent %ld/%ld bytes\n", bytes_sent, packet_len);
+            close(sfd);
+            return -1;
+        }
+
+        // 5. RECEIVE + PARSE
+        char buf[256];
+        socklen_t saddrlen = sizeof(saddr);
+        char* recvd_packet = malloc(packet_len); // should be same length as sent packet (constant anyway)
+        struct icmphdr recvd_header;
+        int timeout = 0;
+        while(1)
+        {
+            // check if we have been waiting more than a second
+            timespec_get(&now, TIME_UTC);
+            
+
+            size_t bytes_recvd = recvfrom(sfd, buf, 256, 0, (struct sockaddr*)&saddr, &saddrlen);
+
+            if(bytes_recvd == -1)
+            {
+                printf("Request timeout for icmp_seq %ud\n", seq);
+                timeout = 1;
+                break;
+            }
+
+            // get size of IP header 
+            int IHL_bytes = (buf[0] & 0x0f)*4;
+            // printf("Received packet with IP header of size %d\n", IHL_bytes);
+            // extract ICMP packet
+            if(bytes_recvd <= IHL_bytes)
+            {
+                continue;
+            }
+            memcpy(recvd_packet, buf+IHL_bytes, packet_len);
+
+            // 6. Matching
+            // Need to match this ICMP packet to the one we sent
+            // extract the header
+            memcpy(&recvd_header, recvd_packet, sizeof(recvd_header));
+            if(recvd_header.type != 0 // echo reply
+                || recvd_header.code != echo.code)  
+            {
+                printf("Received header but didn't match code\n");
+                continue; // wasn't our reply packet, on to the next;
+            }
+            else if(recvd_header.un.echo.id != getpid())
+            {
+                printf("Received header but echo id didn't match pid\n");
+                continue;
+            }
+            else 
+            {
+                break;
+            }
+        }
+        if(timeout)
         {
             continue;
         }
-        memcpy(recvd_packet, buf+IHL_bytes, packet_len);
 
-        // 6. Matching
-        // Need to match this ICMP packet to the one we sent
-        // extract the header
-        memcpy(&recvd_header, recvd_packet, sizeof(recvd_header));
-        if(recvd_header.type != 0 // echo reply
-            || recvd_header.code != echo.code)  
-        {
-            printf("Received header but didn't match code\n");
-            continue; // wasn't our reply packet, on to the next;
-        }
-        else 
-        {
-            break;
-        }
+        // 7. RTT 
+        // find current timestamp and find difference between one sent 
+        struct timespec recvd_stamp;
+        memcpy(&recvd_stamp, recvd_packet + sizeof(recvd_header), sizeof(recvd_stamp));
+        timespec_get(&now, TIME_UTC);
+
+        // find difference
+        time_t d_sec = now.tv_sec - recvd_stamp.tv_sec;
+        time_t d_nanos = now.tv_nsec - recvd_stamp.tv_nsec;
+
+        time_t rtt = d_sec * 1e9 + d_nanos;
+        printf("seq = %u time = %f ms\n", seq, 1e-6*rtt);
     }
-
-    // 7. RTT 
-    // find current timestamp and find difference between one sent 
-    struct timespec recvd_stamp;
-    memcpy(&recvd_stamp, recvd_packet + sizeof(recvd_header), sizeof(recvd_stamp));
-    timespec_get(&now, TIME_UTC);
-
-    // find difference
-    time_t d_sec = now.tv_sec - recvd_stamp.tv_sec;
-    time_t d_nanos = now.tv_nsec - recvd_stamp.tv_nsec;
-
-    time_t rtt = d_sec * 1e9 + d_nanos;
-    printf("RTT: %ld ns\n", rtt);
 
     close(sfd);
 
 }
+
